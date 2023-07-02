@@ -45,44 +45,46 @@ func main() {
 
 	c.Flags = []cli.Flag{
 		&cli.StringFlag{
-			Name:    "mig-strategy",
-			Value:   spec.MigStrategyNone,
-			Usage:   "the desired strategy for exposing MIG devices on GPUs that support it:\n\t\t[none | single | mixed]",
+			Name:  "mig-strategy",
+			Value: spec.MigStrategyNone,
+			// MIG模式定义了如何将GPU划分为多个较小的实例，以及每个实例所拥有的资源数量。
+			// 通常有两种MIG模式可供选择：静态模式和动态模式。静态模式需要在系统启动时进行配置，而动态模式允许在运行时根据需要进行实例的创建和销毁。
+			Usage:   "在支持MIG的gpu上公开MIG设备所需的策略:\n\t\t[none | single | mixed]",
 			EnvVars: []string{"MIG_STRATEGY"},
 		},
 		&cli.BoolFlag{
 			Name:    "fail-on-init-error",
 			Value:   true,
-			Usage:   "fail the plugin if an error is encountered during initialization, otherwise block indefinitely",
+			Usage:   "如果在初始化过程中遇到错误，则失败插件，否则将无限期阻塞",
 			EnvVars: []string{"FAIL_ON_INIT_ERROR"},
 		},
 		&cli.StringFlag{
 			Name:    "nvidia-driver-root",
 			Value:   "/",
-			Usage:   "the root path for the NVIDIA driver installation (typical values are '/' or '/run/nvidia/driver')",
+			Usage:   "NVIDIA驱动安装的根路径 (typical values are '/' or '/run/nvidia/driver')",
 			EnvVars: []string{"NVIDIA_DRIVER_ROOT"},
 		},
 		&cli.BoolFlag{
 			Name:    "pass-device-specs",
 			Value:   false,
-			Usage:   "pass the list of DeviceSpecs to the kubelet on Allocate()",
+			Usage:   "通过Allocate()将deviceSpec列表传递给kubelet",
 			EnvVars: []string{"PASS_DEVICE_SPECS"},
 		},
 		&cli.StringFlag{
 			Name:    "device-list-strategy",
 			Value:   spec.DeviceListStrategyEnvvar,
-			Usage:   "the desired strategy for passing the device list to the underlying runtime:\n\t\t[envvar | volume-mounts]",
+			Usage:   "将设备列表传递到底层运行时所需的策略:\n\t\t[envvar | volume-mounts | cdi-annotations]",
 			EnvVars: []string{"DEVICE_LIST_STRATEGY"},
 		},
 		&cli.StringFlag{
 			Name:    "device-id-strategy",
 			Value:   spec.DeviceIDStrategyUUID,
-			Usage:   "the desired strategy for passing device IDs to the underlying runtime:\n\t\t[uuid | index]",
+			Usage:   "将设备id传递到底层运行时所需的策略:\n\t\t[uuid | index]",
 			EnvVars: []string{"DEVICE_ID_STRATEGY"},
 		},
 		&cli.StringFlag{
 			Name:        "config-file",
-			Usage:       "the path to a config file as an alternative to command line options or environment variables",
+			Usage:       "配置文件的路径，作为命令行选项或环境变量的替代方案",
 			Destination: &configFile,
 			EnvVars:     []string{"CONFIG_FILE"},
 		},
@@ -94,30 +96,6 @@ func main() {
 		log.Printf("Error: %v", err)
 		os.Exit(1)
 	}
-}
-
-func validateFlags(config *spec.Config) error {
-	if *config.Flags.Plugin.DeviceListStrategy != spec.DeviceListStrategyEnvvar && *config.Flags.Plugin.DeviceListStrategy != spec.DeviceListStrategyVolumeMounts {
-		return fmt.Errorf("invalid --device-list-strategy option: %v", *config.Flags.Plugin.DeviceListStrategy)
-	}
-
-	if *config.Flags.Plugin.DeviceIDStrategy != spec.DeviceIDStrategyUUID && *config.Flags.Plugin.DeviceIDStrategy != spec.DeviceIDStrategyIndex {
-		return fmt.Errorf("invalid --device-id-strategy option: %v", *config.Flags.Plugin.DeviceIDStrategy)
-	}
-	return nil
-}
-
-func loadConfig(c *cli.Context, flags []cli.Flag) (*spec.Config, error) {
-	config, err := spec.NewConfig(c, flags)
-	if err != nil {
-		return nil, fmt.Errorf("unable to finalize config: %v", err)
-	}
-	err = validateFlags(config)
-	if err != nil {
-		return nil, fmt.Errorf("unable to validate flags: %v", err)
-	}
-	config.Flags.GFD = nil
-	return config, nil
 }
 
 func start(c *cli.Context, flags []cli.Flag) error {
@@ -199,6 +177,81 @@ exit:
 	return nil
 }
 
+func stopPlugins(plugins []*NvidiaDevicePlugin) error {
+	log.Println("Stopping plugins.")
+	for _, p := range plugins {
+		p.Stop()
+	}
+	log.Println("Shutting down NVML.")
+	if err := nvml.Shutdown(); err != nil {
+		return fmt.Errorf("error shutting down NVML: %v", err)
+	}
+	return nil
+}
+
+// disableResourceRenamingInConfig 暂时禁用插件的资源重命名功能。
+// 我们计划在未来的发布中重新启用此功能。
+func disableResourceRenamingInConfig(config *spec.Config) {
+	// Disable resource renaming through config.Resource
+	if len(config.Resources.GPUs) > 0 || len(config.Resources.MIGs) > 0 {
+		log.Printf("Customizing the 'resources' field is not yet supported in the config. Ignoring...")
+	}
+	config.Resources.GPUs = nil
+	config.Resources.MIGs = nil
+
+	// Disable renaming / device selection in Sharing.TimeSlicing.Resources
+	renameByDefault := config.Sharing.TimeSlicing.RenameByDefault
+	setsNonDefaultRename := false
+	setsDevices := false
+	for i, r := range config.Sharing.TimeSlicing.Resources {
+		if !renameByDefault && r.Rename != "" {
+			setsNonDefaultRename = true
+			config.Sharing.TimeSlicing.Resources[i].Rename = ""
+		}
+		if renameByDefault && r.Rename != r.Name.DefaultSharedRename() {
+			setsNonDefaultRename = true
+			config.Sharing.TimeSlicing.Resources[i].Rename = r.Name.DefaultSharedRename()
+		}
+		if !r.Devices.All {
+			setsDevices = true
+			config.Sharing.TimeSlicing.Resources[i].Devices.All = true
+			config.Sharing.TimeSlicing.Resources[i].Devices.Count = 0
+			config.Sharing.TimeSlicing.Resources[i].Devices.List = nil
+		}
+	}
+	if setsNonDefaultRename {
+		log.Printf("Setting the 'rename' field in sharing.timeSlicing.resources is not yet supported in the config. Ignoring...")
+	}
+	if setsDevices {
+		log.Printf("Customizing the 'devices' field in sharing.timeSlicing.resources is not yet supported in the config. Ignoring...")
+	}
+}
+
+func validateFlags(config *spec.Config) error {
+	if *config.Flags.Plugin.DeviceListStrategy != spec.DeviceListStrategyEnvvar && *config.Flags.Plugin.DeviceListStrategy != spec.DeviceListStrategyVolumeMounts {
+		return fmt.Errorf("invalid --device-list-strategy option: %v", *config.Flags.Plugin.DeviceListStrategy)
+	}
+
+	if *config.Flags.Plugin.DeviceIDStrategy != spec.DeviceIDStrategyUUID && *config.Flags.Plugin.DeviceIDStrategy != spec.DeviceIDStrategyIndex {
+		return fmt.Errorf("invalid --device-id-strategy option: %v", *config.Flags.Plugin.DeviceIDStrategy)
+	}
+	return nil
+}
+
+func loadConfig(c *cli.Context, flags []cli.Flag) (*spec.Config, error) {
+	config, err := spec.NewConfig(c, flags)
+	if err != nil {
+		return nil, fmt.Errorf("unable to finalize config: %v", err)
+	}
+
+	err = validateFlags(config)
+	if err != nil {
+		return nil, fmt.Errorf("unable to validate flags: %v", err)
+	}
+	config.Flags.GFD = nil
+	return config, nil
+}
+
 func startPlugins(c *cli.Context, flags []cli.Flag, restarting bool) ([]*NvidiaDevicePlugin, bool, error) {
 	// Load the configuration file
 	log.Println("Loading configuration.")
@@ -273,54 +326,4 @@ func startPlugins(c *cli.Context, flags []cli.Flag, restarting bool) ([]*NvidiaD
 	}
 
 	return plugins, false, nil
-}
-
-func stopPlugins(plugins []*NvidiaDevicePlugin) error {
-	log.Println("Stopping plugins.")
-	for _, p := range plugins {
-		p.Stop()
-	}
-	log.Println("Shutting down NVML.")
-	if err := nvml.Shutdown(); err != nil {
-		return fmt.Errorf("error shutting down NVML: %v", err)
-	}
-	return nil
-}
-
-// disableResourceRenamingInConfig temporarily disable the resource renaming feature of the plugin.
-// We plan to reeenable this feature in a future release.
-func disableResourceRenamingInConfig(config *spec.Config) {
-	// Disable resource renaming through config.Resource
-	if len(config.Resources.GPUs) > 0 || len(config.Resources.MIGs) > 0 {
-		log.Printf("Customizing the 'resources' field is not yet supported in the config. Ignoring...")
-	}
-	config.Resources.GPUs = nil
-	config.Resources.MIGs = nil
-
-	// Disable renaming / device selection in Sharing.TimeSlicing.Resources
-	renameByDefault := config.Sharing.TimeSlicing.RenameByDefault
-	setsNonDefaultRename := false
-	setsDevices := false
-	for i, r := range config.Sharing.TimeSlicing.Resources {
-		if !renameByDefault && r.Rename != "" {
-			setsNonDefaultRename = true
-			config.Sharing.TimeSlicing.Resources[i].Rename = ""
-		}
-		if renameByDefault && r.Rename != r.Name.DefaultSharedRename() {
-			setsNonDefaultRename = true
-			config.Sharing.TimeSlicing.Resources[i].Rename = r.Name.DefaultSharedRename()
-		}
-		if !r.Devices.All {
-			setsDevices = true
-			config.Sharing.TimeSlicing.Resources[i].Devices.All = true
-			config.Sharing.TimeSlicing.Resources[i].Devices.Count = 0
-			config.Sharing.TimeSlicing.Resources[i].Devices.List = nil
-		}
-	}
-	if setsNonDefaultRename {
-		log.Printf("Setting the 'rename' field in sharing.timeSlicing.resources is not yet supported in the config. Ignoring...")
-	}
-	if setsDevices {
-		log.Printf("Customizing the 'devices' field in sharing.timeSlicing.resources is not yet supported in the config. Ignoring...")
-	}
 }

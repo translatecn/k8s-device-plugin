@@ -43,26 +43,6 @@ type Resources struct {
 	MIGs []Resource `json:"mig,omitempty"  yaml:"mig,omitempty"`
 }
 
-// NewResourceName builds a resource name from the standard prefix and a name.
-// An error is returned if the format is incorrect.
-func NewResourceName(n string) (ResourceName, error) {
-	if !strings.HasPrefix(n, ResourceNamePrefix+"/") {
-		n = ResourceNamePrefix + "/" + n
-	}
-
-	if len(n) > MaxResourceNameLength {
-		return "", fmt.Errorf("fully-qualified resource name must be %v characters or less: %v", MaxResourceNameLength, n)
-	}
-
-	_, name := ResourceName(n).Split()
-	invalid := k8s.NameIsDNSSubdomain(name, false)
-	if len(invalid) != 0 {
-		return "", fmt.Errorf("incorrect format for resource name '%v': %v", n, invalid)
-	}
-
-	return ResourceName(n), nil
-}
-
 // NewResource builds a resource from a name and pattern
 func NewResource(pattern, name string) (*Resource, error) {
 	resourceName, err := NewResourceName(name)
@@ -74,15 +54,6 @@ func NewResource(pattern, name string) (*Resource, error) {
 		Name:    resourceName,
 	}
 	return r, nil
-}
-
-// Split splits a full resource name into prefix and name
-func (r ResourceName) Split() (string, string) {
-	split := strings.SplitN(string(r), "/", 2)
-	if len(split) != 2 {
-		return "", string(r)
-	}
-	return split[0], split[1]
 }
 
 // DefaultSharedRename returns the default renaming to apply when this resource is shared
@@ -139,16 +110,6 @@ func (r *ResourceName) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// AddGPUResource adds a GPU resource to the list of GPU resources.
-func (r *Resources) AddGPUResource(pattern, name string) error {
-	resource, err := NewResource(pattern, name)
-	if err != nil {
-		return err
-	}
-	r.GPUs = append(r.GPUs, *resource)
-	return nil
-}
-
 // AddMIGResource adds a MIG resource to the list of MIG resources.
 func (r *Resources) AddMIGResource(pattern, name string) error {
 	resource, err := NewResource(pattern, name)
@@ -177,4 +138,43 @@ func wildCardToRegexp(pattern string) string {
 		result.WriteString(regexp.QuoteMeta(literal))
 	}
 	return result.String()
+}
+
+// NewResourceName builds a resource name from the standard prefix and a name.
+// An error is returned if the format is incorrect.
+func NewResourceName(n string) (ResourceName, error) {
+	if !strings.HasPrefix(n, ResourceNamePrefix+"/") {
+		n = ResourceNamePrefix + "/" + n
+	}
+
+	if len(n) > MaxResourceNameLength {
+		return "", fmt.Errorf("fully-qualified resource name must be %v characters or less: %v", MaxResourceNameLength, n)
+	}
+
+	_, name := ResourceName(n).Split()
+	invalid := k8s.NameIsDNSSubdomain(name, false)
+	if len(invalid) != 0 {
+		return "", fmt.Errorf("incorrect format for resource name '%v': %v", n, invalid)
+	}
+
+	return ResourceName(n), nil
+}
+
+// AddGPUResource adds a GPU resource to the list of GPU resources.
+func (r *Resources) AddGPUResource(pattern, name string) error {
+	resource, err := NewResource(pattern, name)
+	if err != nil {
+		return err
+	}
+	r.GPUs = append(r.GPUs, *resource)
+	return nil
+}
+
+// Split splits a full resource name into prefix and name
+func (r ResourceName) Split() (string, string) {
+	split := strings.SplitN(string(r), "/", 2)
+	if len(split) != 2 {
+		return "", string(r)
+	}
+	return split[0], split[1]
 }

@@ -18,7 +18,6 @@ package rm
 
 import (
 	"fmt"
-
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
 )
@@ -38,6 +37,30 @@ type ResourceManager interface {
 	Devices() Devices
 	GetPreferredAllocation(available, required []string, size int) ([]string, error)
 	CheckHealth(stop <-chan interface{}, unhealthy chan<- *Device) error
+}
+
+// Resource gets the resource name associated with the ResourceManager
+func (r *resourceManager) Resource() spec.ResourceName {
+	return r.resource
+}
+
+// Resource gets the devices managed by the ResourceManager
+func (r *resourceManager) Devices() Devices {
+	return r.devices
+}
+
+// AddDefaultResourcesToConfig adds default resource matching rules to config.Resources
+func AddDefaultResourcesToConfig(config *spec.Config) error {
+	config.Resources.AddGPUResource("*", "gpu")
+	switch *config.Flags.MigStrategy {
+	case spec.MigStrategySingle:
+		return config.Resources.AddMIGResource("*", "gpu")
+	case spec.MigStrategyMixed:
+		return walkMigProfiles(func(migProfile string) error {
+			return config.Resources.AddMIGResource(migProfile, "mig-"+migProfile)
+		})
+	}
+	return nil
 }
 
 // NewResourceManagers returns a []ResourceManager, one for each resource in 'config'.
@@ -65,16 +88,6 @@ func NewResourceManagers(config *spec.Config) ([]ResourceManager, error) {
 	return rms, nil
 }
 
-// Resource gets the resource name associated with the ResourceManager
-func (r *resourceManager) Resource() spec.ResourceName {
-	return r.resource
-}
-
-// Resource gets the devices managed by the ResourceManager
-func (r *resourceManager) Devices() Devices {
-	return r.devices
-}
-
 // CheckHealth performs health checks on a set of devices, writing to the 'unhealthy' channel with any unhealthy devices
 func (r *resourceManager) CheckHealth(stop <-chan interface{}, unhealthy chan<- *Device) error {
 	return r.checkHealth(stop, r.devices, unhealthy)
@@ -84,18 +97,4 @@ func (r *resourceManager) CheckHealth(stop <-chan interface{}, unhealthy chan<- 
 // The algorithm chosen is based both on the incoming set of available devices and various config settings.
 func (r *resourceManager) GetPreferredAllocation(available, required []string, size int) ([]string, error) {
 	return r.getPreferredAllocation(available, required, size)
-}
-
-// AddDefaultResourcesToConfig adds default resource matching rules to config.Resources
-func AddDefaultResourcesToConfig(config *spec.Config) error {
-	config.Resources.AddGPUResource("*", "gpu")
-	switch *config.Flags.MigStrategy {
-	case spec.MigStrategySingle:
-		return config.Resources.AddMIGResource("*", "gpu")
-	case spec.MigStrategyMixed:
-		return walkMigProfiles(func(migProfile string) error {
-			return config.Resources.AddMIGResource(migProfile, "mig-"+migProfile)
-		})
-	}
-	return nil
 }

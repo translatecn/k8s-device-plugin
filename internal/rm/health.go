@@ -18,12 +18,11 @@ package rm
 
 import (
 	"fmt"
+	"github.com/NVIDIA/k8s-device-plugin/internal/mig"
 	"log"
 	"os"
 	"strconv"
 	"strings"
-
-	"github.com/NVIDIA/k8s-device-plugin/internal/mig"
 )
 
 const (
@@ -34,6 +33,31 @@ const (
 	envDisableHealthChecks = "DP_DISABLE_HEALTHCHECKS"
 	allHealthChecks        = "xids"
 )
+
+// getAdditionalXids returns a list of additional Xids to skip from the specified string.
+// The input is treaded as a comma-separated string and all valid uint64 values are considered as Xid values. Invalid values
+// are ignored.
+func getAdditionalXids(input string) []uint64 {
+	if input == "" {
+		return nil
+	}
+
+	var additionalXids []uint64
+	for _, additionalXid := range strings.Split(input, ",") {
+		trimmed := strings.TrimSpace(additionalXid)
+		if trimmed == "" {
+			continue
+		}
+		xid, err := strconv.ParseUint(trimmed, 10, 64)
+		if err != nil {
+			log.Printf("Ignoring malformed Xid value %v: %v", trimmed, err)
+			continue
+		}
+		additionalXids = append(additionalXids, xid)
+	}
+
+	return additionalXids
+}
 
 // CheckHealth performs health checks on a set of devices, writing to the 'unhealthy' channel with any unhealthy devices
 func (r *resourceManager) checkHealth(stop <-chan interface{}, devices Devices, unhealthy chan<- *Device) error {
@@ -49,11 +73,11 @@ func (r *resourceManager) checkHealth(stop <-chan interface{}, devices Devices, 
 	// http://docs.nvidia.com/deploy/xid-errors/index.html#topic_4
 	// Application errors: the GPU should still be healthy
 	applicationErrorXids := []uint64{
-		13, // Graphics Engine Exception
-		31, // GPU memory page fault
-		43, // GPU stopped processing
-		45, // Preemptive cleanup, due to previous errors
-		68, // Video processor exception
+		13, // 图形引擎异常
+		31, // GPU内存页面故障
+		43, // GPU停止处理
+		45, // 抢占式清理，由于以前的错误
+		68, // 视频处理器异常
 	}
 
 	skippedXids := make(map[uint64]bool)
@@ -126,29 +150,4 @@ func (r *resourceManager) checkHealth(stop <-chan interface{}, devices Devices, 
 			}
 		}
 	}
-}
-
-// getAdditionalXids returns a list of additional Xids to skip from the specified string.
-// The input is treaded as a comma-separated string and all valid uint64 values are considered as Xid values. Invalid values
-// are ignored.
-func getAdditionalXids(input string) []uint64 {
-	if input == "" {
-		return nil
-	}
-
-	var additionalXids []uint64
-	for _, additionalXid := range strings.Split(input, ",") {
-		trimmed := strings.TrimSpace(additionalXid)
-		if trimmed == "" {
-			continue
-		}
-		xid, err := strconv.ParseUint(trimmed, 10, 64)
-		if err != nil {
-			log.Printf("Ignoring malformed Xid value %v: %v", trimmed, err)
-			continue
-		}
-		additionalXids = append(additionalXids, xid)
-	}
-
-	return additionalXids
 }

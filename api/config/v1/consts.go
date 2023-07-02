@@ -16,27 +16,27 @@
 
 package v1
 
-// Constants related to resource names
+// 相关的资源名称
 const (
 	ResourceNamePrefix              = "nvidia.com"
 	DefaultSharedResourceNameSuffix = ".shared"
 	MaxResourceNameLength           = 63
 )
 
-// Constants representing the various MIG strategies
+// MIG（Managed Instance Group）策略的常量
 const (
 	MigStrategyNone   = "none"
 	MigStrategySingle = "single"
 	MigStrategyMixed  = "mixed"
 )
 
-// Constants to represent the various device list strategies
+// 设备列表策略
 const (
 	DeviceListStrategyEnvvar       = "envvar"
 	DeviceListStrategyVolumeMounts = "volume-mounts"
 )
 
-// Constants to represent the various device id strategies
+// 设备ID策略
 const (
 	DeviceIDStrategyUUID  = "uuid"
 	DeviceIDStrategyIndex = "index"

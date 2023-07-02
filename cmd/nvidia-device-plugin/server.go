@@ -17,6 +17,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -51,6 +52,137 @@ type NvidiaDevicePlugin struct {
 	stop   chan interface{}
 }
 
+// ListAndWatch lists devices and update that list according to the health status
+func (plugin *NvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
+	s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()})
+
+	for {
+		select {
+		case <-plugin.stop:
+			return nil
+		case d := <-plugin.health:
+			// FIXME: there is no way to recover from the Unhealthy state.
+			d.Health = pluginapi.Unhealthy
+			log.Printf("'%s' device marked unhealthy: %s", plugin.rm.Resource(), d.ID)
+			s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()})
+		}
+	}
+}
+
+// Allocate which return list of devices.
+func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
+	responses := pluginapi.AllocateResponse{}
+	for _, req := range reqs.ContainerRequests {
+		// If the devices being allocated are replicas, then (conditionally)
+		// error out if more than one resource is being allocated.
+		if plugin.config.Sharing.TimeSlicing.FailRequestsGreaterThanOne && // 失败请求大于1
+			rm.AnnotatedIDs(req.DevicesIDs).AnyHasAnnotations() {
+			if len(req.DevicesIDs) > 1 {
+				return nil, fmt.Errorf("request for '%v: %v' too large: maximum request size for shared resources is 1", plugin.rm.Resource(), len(req.DevicesIDs))
+			}
+		}
+
+		for _, id := range req.DevicesIDs {
+			if !plugin.rm.Devices().Contains(id) {
+				return nil, fmt.Errorf("invalid allocation request for '%s': unknown device: %s", plugin.rm.Resource(), id)
+			}
+		}
+
+		response := pluginapi.ContainerAllocateResponse{}
+
+		ids := req.DevicesIDs
+		deviceIDs := plugin.deviceIDsFromAnnotatedDeviceIDs(ids)
+
+		if *plugin.config.Flags.Plugin.DeviceListStrategy == spec.DeviceListStrategyEnvvar {
+			response.Envs = plugin.apiEnvs(plugin.deviceListEnvvar, deviceIDs)
+		}
+		if *plugin.config.Flags.Plugin.DeviceListStrategy == spec.DeviceListStrategyVolumeMounts {
+			response.Envs = plugin.apiEnvs(plugin.deviceListEnvvar, []string{deviceListAsVolumeMountsContainerPathRoot})
+			response.Mounts = plugin.apiMounts(deviceIDs)
+		}
+		if *plugin.config.Flags.Plugin.PassDeviceSpecs {
+			response.Devices = plugin.apiDeviceSpecs(*plugin.config.Flags.NvidiaDriverRoot, ids)
+		}
+
+		responses.ContainerResponses = append(responses.ContainerResponses, &response)
+	}
+	indent, _ := json.MarshalIndent(responses, "", "  ")
+	fmt.Println(string(indent))
+	return &responses, nil
+}
+
+// -------------------------------------------------------------------------------------------------------------------
+
+// PreStartContainer is unimplemented for this plugin
+func (plugin *NvidiaDevicePlugin) PreStartContainer(context.Context, *pluginapi.PreStartContainerRequest) (*pluginapi.PreStartContainerResponse, error) {
+	return &pluginapi.PreStartContainerResponse{}, nil
+}
+
+func (plugin *NvidiaDevicePlugin) apiDeviceSpecs(driverRoot string, ids []string) []*pluginapi.DeviceSpec {
+	var specs []*pluginapi.DeviceSpec
+
+	paths := []string{
+		"/dev/nvidiactl",
+		"/dev/nvidia-uvm",
+		"/dev/nvidia-uvm-tools",
+		"/dev/nvidia-modeset",
+	}
+
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			spec := &pluginapi.DeviceSpec{
+				ContainerPath: p,
+				HostPath:      filepath.Join(driverRoot, p),
+				Permissions:   "rw",
+			}
+			specs = append(specs, spec)
+		}
+	}
+
+	for _, p := range plugin.rm.Devices().Subset(ids).GetPaths() {
+		spec := &pluginapi.DeviceSpec{
+			ContainerPath: p,
+			HostPath:      filepath.Join(driverRoot, p),
+			Permissions:   "rw",
+		}
+		specs = append(specs, spec)
+	}
+
+	return specs
+}
+
+func (plugin *NvidiaDevicePlugin) apiMounts(deviceIDs []string) []*pluginapi.Mount {
+	var mounts []*pluginapi.Mount
+
+	for _, id := range deviceIDs {
+		mount := &pluginapi.Mount{
+			HostPath:      deviceListAsVolumeMountsHostPath,
+			ContainerPath: filepath.Join(deviceListAsVolumeMountsContainerPathRoot, id),
+		}
+		mounts = append(mounts, mount)
+	}
+
+	return mounts
+}
+func (plugin *NvidiaDevicePlugin) deviceIDsFromAnnotatedDeviceIDs(ids []string) []string {
+	var deviceIDs []string
+	if *plugin.config.Flags.Plugin.DeviceIDStrategy == spec.DeviceIDStrategyUUID {
+		deviceIDs = rm.AnnotatedIDs(ids).GetIDs()
+	}
+	if *plugin.config.Flags.Plugin.DeviceIDStrategy == spec.DeviceIDStrategyIndex {
+		deviceIDs = plugin.rm.Devices().Subset(ids).GetIndices()
+	}
+	return deviceIDs
+}
+func (plugin *NvidiaDevicePlugin) apiEnvs(envvar string, deviceIDs []string) map[string]string {
+	return map[string]string{
+		envvar: strings.Join(deviceIDs, ","),
+	}
+}
+func (plugin *NvidiaDevicePlugin) apiDevices() []*pluginapi.Device {
+	return plugin.rm.Devices().GetPluginDevices()
+}
+
 // NewNvidiaDevicePlugin returns an initialized NvidiaDevicePlugin
 func NewNvidiaDevicePlugin(config *spec.Config, resourceManager rm.ResourceManager) *NvidiaDevicePlugin {
 	_, name := resourceManager.Resource().Split()
@@ -73,58 +205,6 @@ func (plugin *NvidiaDevicePlugin) initialize() {
 	plugin.server = grpc.NewServer([]grpc.ServerOption{}...)
 	plugin.health = make(chan *rm.Device)
 	plugin.stop = make(chan interface{})
-}
-
-func (plugin *NvidiaDevicePlugin) cleanup() {
-	close(plugin.stop)
-	plugin.server = nil
-	plugin.health = nil
-	plugin.stop = nil
-}
-
-// Devices returns the full set of devices associated with the plugin.
-func (plugin *NvidiaDevicePlugin) Devices() rm.Devices {
-	return plugin.rm.Devices()
-}
-
-// Start starts the gRPC server, registers the device plugin with the Kubelet,
-// and starts the device healthchecks.
-func (plugin *NvidiaDevicePlugin) Start() error {
-	plugin.initialize()
-
-	err := plugin.Serve()
-	if err != nil {
-		log.Printf("Could not start device plugin for '%s': %s", plugin.rm.Resource(), err)
-		plugin.cleanup()
-		return err
-	}
-	log.Printf("Starting to serve '%s' on %s", plugin.rm.Resource(), plugin.socket)
-
-	err = plugin.Register()
-	if err != nil {
-		log.Printf("Could not register device plugin: %s", err)
-		plugin.Stop()
-		return err
-	}
-	log.Printf("Registered device plugin for '%s' with Kubelet", plugin.rm.Resource())
-
-	go plugin.rm.CheckHealth(plugin.stop, plugin.health)
-
-	return nil
-}
-
-// Stop stops the gRPC server.
-func (plugin *NvidiaDevicePlugin) Stop() error {
-	if plugin == nil || plugin.server == nil {
-		return nil
-	}
-	log.Printf("Stopping to serve '%s' on %s", plugin.rm.Resource(), plugin.socket)
-	plugin.server.Stop()
-	if err := os.Remove(plugin.socket); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	plugin.cleanup()
-	return nil
 }
 
 // Serve starts the gRPC server of the device plugin.
@@ -202,6 +282,58 @@ func (plugin *NvidiaDevicePlugin) Register() error {
 	return nil
 }
 
+// Start starts the gRPC server, registers the device plugin with the Kubelet,
+// and starts the device healthchecks.
+func (plugin *NvidiaDevicePlugin) Start() error {
+	plugin.initialize()
+
+	err := plugin.Serve()
+	if err != nil {
+		log.Printf("Could not start device plugin for '%s': %s", plugin.rm.Resource(), err)
+		plugin.cleanup()
+		return err
+	}
+	log.Printf("Starting to serve '%s' on %s", plugin.rm.Resource(), plugin.socket)
+
+	err = plugin.Register()
+	if err != nil {
+		log.Printf("Could not register device plugin: %s", err)
+		plugin.Stop()
+		return err
+	}
+	log.Printf("Registered device plugin for '%s' with Kubelet", plugin.rm.Resource())
+
+	go plugin.rm.CheckHealth(plugin.stop, plugin.health)
+
+	return nil
+}
+
+// Stop stops the gRPC server.
+func (plugin *NvidiaDevicePlugin) Stop() error {
+	if plugin == nil || plugin.server == nil {
+		return nil
+	}
+	log.Printf("Stopping to serve '%s' on %s", plugin.rm.Resource(), plugin.socket)
+	plugin.server.Stop()
+	if err := os.Remove(plugin.socket); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	plugin.cleanup()
+	return nil
+}
+
+func (plugin *NvidiaDevicePlugin) cleanup() {
+	close(plugin.stop)
+	plugin.server = nil
+	plugin.health = nil
+	plugin.stop = nil
+}
+
+// Devices returns the full set of devices associated with the plugin.
+func (plugin *NvidiaDevicePlugin) Devices() rm.Devices {
+	return plugin.rm.Devices()
+}
+
 // GetDevicePluginOptions returns the values of the optional settings for this plugin
 func (plugin *NvidiaDevicePlugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
 	options := &pluginapi.DevicePluginOptions{
@@ -210,28 +342,14 @@ func (plugin *NvidiaDevicePlugin) GetDevicePluginOptions(context.Context, *plugi
 	return options, nil
 }
 
-// ListAndWatch lists devices and update that list according to the health status
-func (plugin *NvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
-	s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()})
-
-	for {
-		select {
-		case <-plugin.stop:
-			return nil
-		case d := <-plugin.health:
-			// FIXME: there is no way to recover from the Unhealthy state.
-			d.Health = pluginapi.Unhealthy
-			log.Printf("'%s' device marked unhealthy: %s", plugin.rm.Resource(), d.ID)
-			s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()})
-		}
-	}
-}
-
 // GetPreferredAllocation returns the preferred allocation from the set of devices specified in the request
+// 获得优先分配
 func (plugin *NvidiaDevicePlugin) GetPreferredAllocation(ctx context.Context, r *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
 	response := &pluginapi.PreferredAllocationResponse{}
 	for _, req := range r.ContainerRequests {
-		devices, err := plugin.rm.GetPreferredAllocation(req.AvailableDeviceIDs, req.MustIncludeDeviceIDs, int(req.AllocationSize))
+		devices, err := plugin.rm.GetPreferredAllocation(req.AvailableDeviceIDs, // 可用设备id列表，从中选择首选分配
+			req.MustIncludeDeviceIDs, // 必须包含在首选分配中的设备id列表
+			int(req.AllocationSize))  // 申请的设备数量
 		if err != nil {
 			return nil, fmt.Errorf("error getting list of preferred allocation devices: %v", err)
 		}
@@ -243,51 +361,6 @@ func (plugin *NvidiaDevicePlugin) GetPreferredAllocation(ctx context.Context, r 
 		response.ContainerResponses = append(response.ContainerResponses, resp)
 	}
 	return response, nil
-}
-
-// Allocate which return list of devices.
-func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
-	responses := pluginapi.AllocateResponse{}
-	for _, req := range reqs.ContainerRequests {
-		// If the devices being allocated are replicas, then (conditionally)
-		// error out if more than one resource is being allocated.
-		if plugin.config.Sharing.TimeSlicing.FailRequestsGreaterThanOne && rm.AnnotatedIDs(req.DevicesIDs).AnyHasAnnotations() {
-			if len(req.DevicesIDs) > 1 {
-				return nil, fmt.Errorf("request for '%v: %v' too large: maximum request size for shared resources is 1", plugin.rm.Resource(), len(req.DevicesIDs))
-			}
-		}
-
-		for _, id := range req.DevicesIDs {
-			if !plugin.rm.Devices().Contains(id) {
-				return nil, fmt.Errorf("invalid allocation request for '%s': unknown device: %s", plugin.rm.Resource(), id)
-			}
-		}
-
-		response := pluginapi.ContainerAllocateResponse{}
-
-		ids := req.DevicesIDs
-		deviceIDs := plugin.deviceIDsFromAnnotatedDeviceIDs(ids)
-
-		if *plugin.config.Flags.Plugin.DeviceListStrategy == spec.DeviceListStrategyEnvvar {
-			response.Envs = plugin.apiEnvs(plugin.deviceListEnvvar, deviceIDs)
-		}
-		if *plugin.config.Flags.Plugin.DeviceListStrategy == spec.DeviceListStrategyVolumeMounts {
-			response.Envs = plugin.apiEnvs(plugin.deviceListEnvvar, []string{deviceListAsVolumeMountsContainerPathRoot})
-			response.Mounts = plugin.apiMounts(deviceIDs)
-		}
-		if *plugin.config.Flags.Plugin.PassDeviceSpecs {
-			response.Devices = plugin.apiDeviceSpecs(*plugin.config.Flags.NvidiaDriverRoot, ids)
-		}
-
-		responses.ContainerResponses = append(responses.ContainerResponses, &response)
-	}
-
-	return &responses, nil
-}
-
-// PreStartContainer is unimplemented for this plugin
-func (plugin *NvidiaDevicePlugin) PreStartContainer(context.Context, *pluginapi.PreStartContainerRequest) (*pluginapi.PreStartContainerResponse, error) {
-	return &pluginapi.PreStartContainerResponse{}, nil
 }
 
 // dial establishes the gRPC communication with the registered device plugin.
@@ -304,72 +377,4 @@ func (plugin *NvidiaDevicePlugin) dial(unixSocketPath string, timeout time.Durat
 	}
 
 	return c, nil
-}
-
-func (plugin *NvidiaDevicePlugin) deviceIDsFromAnnotatedDeviceIDs(ids []string) []string {
-	var deviceIDs []string
-	if *plugin.config.Flags.Plugin.DeviceIDStrategy == spec.DeviceIDStrategyUUID {
-		deviceIDs = rm.AnnotatedIDs(ids).GetIDs()
-	}
-	if *plugin.config.Flags.Plugin.DeviceIDStrategy == spec.DeviceIDStrategyIndex {
-		deviceIDs = plugin.rm.Devices().Subset(ids).GetIndices()
-	}
-	return deviceIDs
-}
-
-func (plugin *NvidiaDevicePlugin) apiDevices() []*pluginapi.Device {
-	return plugin.rm.Devices().GetPluginDevices()
-}
-
-func (plugin *NvidiaDevicePlugin) apiEnvs(envvar string, deviceIDs []string) map[string]string {
-	return map[string]string{
-		envvar: strings.Join(deviceIDs, ","),
-	}
-}
-
-func (plugin *NvidiaDevicePlugin) apiMounts(deviceIDs []string) []*pluginapi.Mount {
-	var mounts []*pluginapi.Mount
-
-	for _, id := range deviceIDs {
-		mount := &pluginapi.Mount{
-			HostPath:      deviceListAsVolumeMountsHostPath,
-			ContainerPath: filepath.Join(deviceListAsVolumeMountsContainerPathRoot, id),
-		}
-		mounts = append(mounts, mount)
-	}
-
-	return mounts
-}
-
-func (plugin *NvidiaDevicePlugin) apiDeviceSpecs(driverRoot string, ids []string) []*pluginapi.DeviceSpec {
-	var specs []*pluginapi.DeviceSpec
-
-	paths := []string{
-		"/dev/nvidiactl",
-		"/dev/nvidia-uvm",
-		"/dev/nvidia-uvm-tools",
-		"/dev/nvidia-modeset",
-	}
-
-	for _, p := range paths {
-		if _, err := os.Stat(p); err == nil {
-			spec := &pluginapi.DeviceSpec{
-				ContainerPath: p,
-				HostPath:      filepath.Join(driverRoot, p),
-				Permissions:   "rw",
-			}
-			specs = append(specs, spec)
-		}
-	}
-
-	for _, p := range plugin.rm.Devices().Subset(ids).GetPaths() {
-		spec := &pluginapi.DeviceSpec{
-			ContainerPath: p,
-			HostPath:      filepath.Join(driverRoot, p),
-			Permissions:   "rw",
-		}
-		specs = append(specs, spec)
-	}
-
-	return specs
 }

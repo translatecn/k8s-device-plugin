@@ -59,17 +59,6 @@ func nvmlLookupSymbol(symbol string) error {
 	return lib.Lookup(symbol)
 }
 
-// nvmlNewEventSet creates a new NVML EventSet
-func nvmlNewEventSet() nvml.EventSet {
-	set, _ := nvml.EventSetCreate()
-	return set
-}
-
-// nvmlDeleteEventSet deletes an NVML EventSet
-func nvmlDeleteEventSet(es nvml.EventSet) {
-	es.Free()
-}
-
 // nvmlWaitForEvent waits for an NVML Event
 func nvmlWaitForEvent(es nvml.EventSet, timeout uint) (nvmlEvent, error) {
 	data, ret := es.Wait(uint32(timeout))
@@ -134,26 +123,6 @@ func nvmlRegisterEventForDevice(es nvml.EventSet, event int, uuid string) error 
 	}
 
 	return fmt.Errorf("nvml: device not found")
-}
-
-// walkGPUDevices walks all of the GPU devices reported by NVML
-func walkGPUDevices(f func(i int, d nvml.Device) error) error {
-	count, ret := nvml.DeviceGetCount()
-	if ret != nvml.SUCCESS {
-		return fmt.Errorf("error getting device count: %v", nvml.ErrorString(ret))
-	}
-
-	for i := 0; i < count; i++ {
-		device, ret := nvml.DeviceGetHandleByIndex(i)
-		if ret != nvml.SUCCESS {
-			return fmt.Errorf("error getting device handle for index '%v': %v", i, nvml.ErrorString(ret))
-		}
-		err := f(i, device)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // walkMigProfiles walks all of the possible MIG profiles across all GPU devices reported by NVML
@@ -274,37 +243,6 @@ func (d nvmlDevice) isMigCapable() (bool, error) {
 	return true, nil
 }
 
-// isMigEnabled checks if MIG is enabled on the given GPU device
-func (d nvmlDevice) isMigEnabled() (bool, error) {
-	err := nvmlLookupSymbol("nvmlDeviceGetMigMode")
-	if err != nil {
-		return false, nil
-	}
-
-	mode, _, ret := nvml.Device(d).GetMigMode()
-	if ret == nvml.ERROR_NOT_SUPPORTED {
-		return false, nil
-	}
-	if ret != nvml.SUCCESS {
-		return false, fmt.Errorf("error getting MIG mode: %v", nvml.ErrorString(ret))
-	}
-
-	return (mode == nvml.DEVICE_MIG_ENABLE), nil
-}
-
-// isMigDevice checks if the given NVML device is a MIG device (as opposed to a GPU device)
-func (d nvmlDevice) isMigDevice() (bool, error) {
-	err := nvmlLookupSymbol("nvmlDeviceIsMigDeviceHandle")
-	if err != nil {
-		return false, nil
-	}
-	isMig, ret := nvml.Device(d).IsMigDeviceHandle()
-	if ret != nvml.SUCCESS {
-		return false, fmt.Errorf("%v", nvml.ErrorString(ret))
-	}
-	return isMig, nil
-}
-
 // getMigProfile gets the MIG profile name associated with the given MIG device
 func (d nvmlDevice) getMigProfile() (string, error) {
 	isMig, err := d.isMigDevice()
@@ -402,4 +340,66 @@ func (d nvmlDevice) getNumaNode() (*int, error) {
 
 	n := int(node)
 	return &n, nil
+}
+
+// walkGPUDevices walks all of the GPU devices reported by NVML
+func walkGPUDevices(f func(i int, d nvml.Device) error) error {
+	count, ret := nvml.DeviceGetCount()
+	if ret != nvml.SUCCESS {
+		return fmt.Errorf("error getting device count: %v", nvml.ErrorString(ret))
+	}
+
+	for i := 0; i < count; i++ {
+		device, ret := nvml.DeviceGetHandleByIndex(i)
+		if ret != nvml.SUCCESS {
+			return fmt.Errorf("error getting device handle for index '%v': %v", i, nvml.ErrorString(ret))
+		}
+		err := f(i, device)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isMigEnabled checks if MIG is enabled on the given GPU device
+func (d nvmlDevice) isMigEnabled() (bool, error) {
+	err := nvmlLookupSymbol("nvmlDeviceGetMigMode")
+	if err != nil {
+		return false, nil
+	}
+
+	mode, _, ret := nvml.Device(d).GetMigMode()
+	if ret == nvml.ERROR_NOT_SUPPORTED {
+		return false, nil
+	}
+	if ret != nvml.SUCCESS {
+		return false, fmt.Errorf("error getting MIG mode: %v", nvml.ErrorString(ret))
+	}
+
+	return (mode == nvml.DEVICE_MIG_ENABLE), nil
+}
+
+// isMigDevice checks if the given NVML device is a MIG device (as opposed to a GPU device)
+func (d nvmlDevice) isMigDevice() (bool, error) {
+	err := nvmlLookupSymbol("nvmlDeviceIsMigDeviceHandle")
+	if err != nil {
+		return false, nil
+	}
+	isMig, ret := nvml.Device(d).IsMigDeviceHandle()
+	if ret != nvml.SUCCESS {
+		return false, fmt.Errorf("%v", nvml.ErrorString(ret))
+	}
+	return isMig, nil
+}
+
+// nvmlNewEventSet creates a new NVML EventSet
+func nvmlNewEventSet() nvml.EventSet {
+	set, _ := nvml.EventSetCreate()
+	return set
+}
+
+// nvmlDeleteEventSet deletes an NVML EventSet
+func nvmlDeleteEventSet(es nvml.EventSet) {
+	es.Free()
 }

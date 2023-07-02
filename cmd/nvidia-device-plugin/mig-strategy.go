@@ -50,15 +50,6 @@ type migStrategyNone struct{ config *spec.Config }
 type migStrategySingle struct{ config *spec.Config }
 type migStrategyMixed struct{ config *spec.Config }
 
-// migStrategyNone
-func (s *migStrategyNone) GetPlugins() []*NvidiaDevicePlugin {
-	rms, err := rm.NewResourceManagers(s.config)
-	if err != nil {
-		panic(fmt.Errorf("Unable to load resource managers to manage plugin devices: %v", err))
-	}
-	return getPlugins(s.config, rms)
-}
-
 // migStrategySingle
 func (s *migStrategySingle) GetPlugins() []*NvidiaDevicePlugin {
 	info := mig.NewDeviceInfo()
@@ -95,6 +86,24 @@ func (s *migStrategySingle) GetPlugins() []*NvidiaDevicePlugin {
 	return getPlugins(s.config, rms)
 }
 
+// migStrategyNone
+func (s *migStrategyNone) GetPlugins() []*NvidiaDevicePlugin {
+	rms, err := rm.NewResourceManagers(s.config)
+	if err != nil {
+		panic(fmt.Errorf("Unable to load resource managers to manage plugin devices: %v", err))
+	}
+	return getPlugins(s.config, rms)
+}
+
+// getPlugins generates the plugins from all ResourceManagers
+func getPlugins(config *spec.Config, rms []rm.ResourceManager) []*NvidiaDevicePlugin {
+	var plugins []*NvidiaDevicePlugin
+	for _, r := range rms {
+		plugins = append(plugins, NewNvidiaDevicePlugin(config, r))
+	}
+	return plugins
+}
+
 // migStrategyMixed
 func (s *migStrategyMixed) GetPlugins() []*NvidiaDevicePlugin {
 	info := mig.NewDeviceInfo()
@@ -109,13 +118,4 @@ func (s *migStrategyMixed) GetPlugins() []*NvidiaDevicePlugin {
 	}
 
 	return getPlugins(s.config, rms)
-}
-
-// getPlugins generates the plugins from all ResourceManagers
-func getPlugins(config *spec.Config, rms []rm.ResourceManager) []*NvidiaDevicePlugin {
-	var plugins []*NvidiaDevicePlugin
-	for _, r := range rms {
-		plugins = append(plugins, NewNvidiaDevicePlugin(config, r))
-	}
-	return plugins
 }

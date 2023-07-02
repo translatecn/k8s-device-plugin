@@ -1,2 +1,4 @@
 /nvidia-device-plugin
 /releases
+.DS_Store
+.idea
